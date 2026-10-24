@@ -1,0 +1,61 @@
+<ui:FluentWindow x:Class="DeskClone.Views.ExitConfirmDialog"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 Title="退出桌面分身"
+                 Width="480"
+                 SizeToContent="Height"
+                 ResizeMode="NoResize"
+                 ShowInTaskbar="False"
+                 WindowStartupLocation="CenterOwner"
+                 WindowBackdropType="Auto">
+    <Grid Margin="28,24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0"
+                    Orientation="Horizontal">
+            <ui:SymbolIcon Margin="0,0,16,0"
+                           FontSize="30"
+                           Foreground="#FFFFC83D"
+                           Symbol="QuestionCircle24"
+                           VerticalAlignment="Top" />
+            <StackPanel>
+                <ui:TextBlock FontSize="16"
+                              FontWeight="SemiBold"
+                              Text="退出后要如何处理分身会话？" />
+                <ui:TextBlock Margin="0,10,0,0"
+                              Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                              TextWrapping="Wrap"
+                              Text="检测到桌面分身会话仍在运行。可以注销分身（其中运行的程序会全部关闭），也可以保留分身转入后台，下次打开程序时重新连接。" />
+                <ui:TextBlock Margin="0,8,0,0"
+                              FontSize="11"
+                              Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                              TextWrapping="Wrap"
+                              Text="注意：注销或重启电脑时，分身会话会被系统一并结束。" />
+            </StackPanel>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1"
+                    Margin="0,24,0,0"
+                    HorizontalAlignment="Right"
+                    Orientation="Horizontal">
+            <ui:Button MinWidth="128"
+                       Margin="0,0,12,0"
+                       Appearance="Danger"
+                       Click="OnLogoffExit"
+                       Content="注销分身并退出" />
+            <ui:Button MinWidth="128"
+                       Margin="0,0,12,0"
+                       Appearance="Primary"
+                       Click="OnPreserveExit"
+                       Content="保留分身退出"
+                       ToolTip="分身会话在后台继续运行，重新打开程序即可重新连接" />
+            <ui:Button MinWidth="88"
+                       Click="OnCancel"
+                       Content="取消" />
+        </StackPanel>
+    </Grid>
+</ui:FluentWindow>

@@ -1,0 +1,16 @@
+# 构建产物
+bin/
+obj/
+dist/
+publish/
+testrun/
+*.pdb
+
+# 运行时生成
+settings.json
+log/
+
+# IDE
+.vs/
+*.user
+.idea/

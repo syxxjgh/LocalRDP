@@ -1,0 +1,18 @@
+<Application x:Class="DeskClone.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:DeskClone.Controls"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             ShutdownMode="OnMainWindowClose">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!-- WPF-UI 的全部控件样式与配色都由这两个字典提供，缺省会导致窗口空白/无样式 -->
+                <ui:ThemesDictionary Theme="Dark" />
+                <ui:ControlsDictionary />
+            </ResourceDictionary.MergedDictionaries>
+            <controls:BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+            <controls:BooleanToVisibilityRevertConverter x:Key="BooleanToVisibilityRevertConverter" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
