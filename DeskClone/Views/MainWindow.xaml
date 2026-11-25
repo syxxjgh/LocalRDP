@@ -43,6 +43,12 @@
                              ToolTip="{Binding ConnectionStatusToolTip}" />
                     <TextBlock VerticalAlignment="Center"
                                Text="桌面分身" />
+                    <TextBlock Margin="12,0,0,0"
+                               VerticalAlignment="Center"
+                               FontSize="12"
+                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               Text="{Binding CurrentAccountBadgeText}"
+                               ToolTip="桌面分身登录的 Windows 账户（不同于当前主桌面账户）" />
                 </StackPanel>
             </ui:TitleBar.Header>
             <ui:TitleBar.TrailingContent>
@@ -125,6 +131,16 @@
                                     <ui:MenuItem Header="发送 Win+Tab 切换窗口"
                                                  Command="{Binding ShowTaskViewCommand}" />
                                 </ui:MenuItem>
+                                <Separator />
+                                <ui:MenuItem Header="切换登录账户…"
+                                             Command="{Binding ConfigureLoginAccountCommand}"
+                                             Icon="{ui:SymbolIcon Person24}"
+                                             ToolTip="选择桌面分身登录的 Windows 账户（不能与当前主桌面账户相同）" />
+                                <ui:MenuItem Header="每次登录前确认登录账户"
+                                             Command="{Binding ToggleConfirmLoginUserBeforeConnectCommand}"
+                                             IsCheckable="True"
+                                             IsChecked="{Binding ConfirmLoginUserBeforeConnect, Mode=OneWay}"
+                                             ToolTip="开启后，每次启动或重新连接桌面分身前都会确认登录账户" />
                                 <Separator />
                                 <ui:MenuItem Header="{Binding WatchModeMenuHeader}"
                                              Command="{Binding ToggleWatchModeCommand}"

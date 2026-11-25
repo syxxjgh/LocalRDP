@@ -44,4 +44,14 @@ public partial class AppSettings : ObservableObject
     /// </summary>
     [ObservableProperty]
     private bool _autoReconnectOnStartup = false;
+
+    /// <summary>
+    /// 上次确认使用的桌面分身登录账户（必须与当前主桌面账户不同）。不保存密码。
+    /// </summary>
+    [ObservableProperty]
+    private string _rdpLoginUserName = string.Empty;
+
+    /// <summary>每次登录桌面分身前是否先确认登录账户。</summary>
+    [ObservableProperty]
+    private bool _confirmLoginUserBeforeConnect = true;
 }

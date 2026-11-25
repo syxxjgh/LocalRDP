@@ -50,6 +50,14 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private bool _isAutoReconnectOnStartup;
 
+    /// <summary>每次登录前是否确认登录账户（持久化设置）。</summary>
+    [ObservableProperty]
+    private bool _confirmLoginUserBeforeConnect;
+
+    /// <summary>标题栏展示的登录账户信息。</summary>
+    [ObservableProperty]
+    private string _currentAccountBadgeText = string.Empty;
+
     [ObservableProperty]
     private Brush _connectionStatusBrush = Brushes.Red;
 
@@ -151,6 +159,7 @@ public partial class MainViewModel : ObservableObject
         _settingsService = settingsService;
         _settings = settingsService.Settings;
         _isAutoReconnectOnStartup = _settings.AutoReconnectOnStartup;
+        _confirmLoginUserBeforeConnect = _childSessionService.ConfirmLoginUserBeforeConnect;
         _isTopmost = _childSessionService.TopmostEnabled;
         _isAdaptive = _childSessionService.SmartSizingEnabled;
         _isOneToOne = !_isAdaptive;
@@ -374,6 +383,11 @@ public partial class MainViewModel : ObservableObject
             }
         }
 
+        if (!await PrepareLoginAccountAsync(forcePrompt: false))
+        {
+            return;
+        }
+
         _startRequested = true;
         IsConnectionPromptVisible = false;
 
@@ -386,6 +400,114 @@ public partial class MainViewModel : ObservableObject
         {
             _startRequested = false;
             UpdateConnectionStatus();
+        }
+    }
+
+    /// <summary>
+    /// 连接前确认桌面分身登录账户，并把账户交给 RDP 控件。已经连接时不需要处理。
+    /// 当设置要求确认、保存的账户无效（空或与主桌面相同），或存活的分身会话登录的是主桌面账户时，
+    /// 会先弹出确认对话框。返回 false 表示用户取消或设置失败，调用方应中止连接。
+    /// </summary>
+    private async Task<bool> PrepareLoginAccountAsync(bool forcePrompt)
+    {
+        if (_childSessionService.ConnectedState == 1 && !forcePrompt)
+        {
+            return true;
+        }
+
+        try
+        {
+            var existingSessionId = ChildSessionNativeMethods.TryGetChildSessionId();
+            var existingAccount = _childSessionService.TryGetExistingChildSessionAccount();
+            var existingIsCurrentUser =
+                ChildSessionAccountHelper.IsCurrentWindowsUser(existingAccount);
+            var savedAccount = _childSessionService.ConfiguredLoginUserName;
+            var savedAccountInvalid = string.IsNullOrWhiteSpace(savedAccount)
+                                      || ChildSessionAccountHelper.IsCurrentWindowsUser(savedAccount);
+            var mustConfirm = forcePrompt
+                              || _childSessionService.ConfirmLoginUserBeforeConnect
+                              || savedAccountInvalid
+                              || existingIsCurrentUser;
+
+            if (!mustConfirm)
+            {
+                // 账户未变化时沿用本次运行内存中的密码。
+                _childSessionService.ConfigureLoginCredentials(savedAccount, password: null);
+                return true;
+            }
+
+            var candidates = ChildSessionAccountHelper.GetCandidateLocalAccounts();
+            var initialAccount = ChildSessionAccountHelper.SuggestLoginAccount(
+                savedAccount,
+                existingIsCurrentUser ? null : existingAccount,
+                candidates);
+            var owner = Application.Current.MainWindow is { IsVisible: true } mainWindow
+                ? mainWindow
+                : null;
+
+            var result = DeskClone.Views.LoginAccountDialog.Prompt(
+                owner,
+                ChildSessionAccountHelper.GetCurrentWindowsAccountName(),
+                candidates,
+                initialAccount,
+                _childSessionService.ConfirmLoginUserBeforeConnect,
+                existingSessionId,
+                existingAccount,
+                existingIsCurrentUser);
+            if (result is null)
+            {
+                return false;
+            }
+
+            _childSessionService.SetConfirmLoginUserBeforeConnect(result.ConfirmBeforeNextConnect);
+            ConfirmLoginUserBeforeConnect = result.ConfirmBeforeNextConnect;
+
+            if (result.ShouldLogoffConflictingSession)
+            {
+                await _childSessionService.LogoffAndHideAsync(existingSessionId);
+            }
+
+            _childSessionService.ConfigureLoginCredentials(result.AccountName, result.Password);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            ShowError(exception);
+            return false;
+        }
+        finally
+        {
+            UpdateConnectionStatus();
+        }
+    }
+
+    [RelayCommand]
+    private void ToggleConfirmLoginUserBeforeConnect()
+    {
+        var enabled = !ConfirmLoginUserBeforeConnect;
+        if (!Execute(() => _childSessionService.SetConfirmLoginUserBeforeConnect(enabled)))
+        {
+            return;
+        }
+
+        ConfirmLoginUserBeforeConnect = _childSessionService.ConfirmLoginUserBeforeConnect;
+        ShowNotification(
+            enabled ? "登录前将确认账户" : "已关闭登录前的账户确认",
+            enabled
+                ? "每次启动或重新连接桌面分身前，都会确认登录账户。"
+                : "将直接使用上次确认的账户；若该账户无效仍会提示。",
+            InfoBarSeverity.Informational);
+    }
+
+    [RelayCommand]
+    private async Task ConfigureLoginAccountAsync()
+    {
+        if (await PrepareLoginAccountAsync(forcePrompt: true))
+        {
+            ShowNotification(
+                "登录账户已设置",
+                $"桌面分身将使用账户 {_childSessionService.ConfiguredLoginUserName} 登录，下次连接时生效。",
+                InfoBarSeverity.Success);
         }
     }
 
@@ -726,6 +848,14 @@ public partial class MainViewModel : ObservableObject
         SendSystemShortcutsToRemote = _childSessionService.SendSystemShortcutsToRemote;
         IsWatchModeEnabled = _childSessionService.WatchModeEnabled;
         IsAudioMuted = _childSessionService.AudioMuted;
+        ConfirmLoginUserBeforeConnect = _childSessionService.ConfirmLoginUserBeforeConnect;
+        var sessionAccount = _childSessionService.ChildSessionAccountName;
+        var configuredAccount = _childSessionService.ConfiguredLoginUserName;
+        CurrentAccountBadgeText = !string.IsNullOrWhiteSpace(sessionAccount)
+            ? $"账户：{sessionAccount}"
+            : !string.IsNullOrWhiteSpace(configuredAccount)
+                ? $"目标账户：{configuredAccount}"
+                : string.Empty;
         IsRdpConnected = connectedState == 1;
         IsConnectionPromptVisible = IsSessionClosing || connectedState == 0 && !_startRequested;
         StartButtonText = childSessionId is not null && connectedState != 1
@@ -747,7 +877,9 @@ public partial class MainViewModel : ObservableObject
         {
             ConnectionStatusBrush = Brushes.LimeGreen;
             ConnectionStatusTitle = "桌面分身已连接";
-            ConnectionStatusDescription = "RDP 连接正常，可以直接在桌面分身中操作。";
+            ConnectionStatusDescription = string.IsNullOrWhiteSpace(sessionAccount)
+                ? "RDP 连接正常，可以直接在桌面分身中操作。"
+                : $"RDP 连接正常，当前登录账户：{sessionAccount}。";
         }
         else if (connectedState == 2)
         {

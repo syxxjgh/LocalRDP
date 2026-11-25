@@ -63,8 +63,15 @@ internal static class ChildSessionProcessLauncher
             ?? throw new InvalidOperationException("当前 Windows 未提供任务计划程序 COM 服务。");
         var taskName = $"DeskClone-ChildSession-ElevatedLaunch-{Guid.NewGuid():N}";
         string accountName;
-        using (var currentIdentity = WindowsIdentity.GetCurrent())
+        // 分身会话登录的是独立账户，计划任务必须以该账户的交互令牌运行，而不是当前主桌面账户。
+        var sessionAccountName = ChildSessionNativeMethods.TryGetSessionAccountName(childSessionId);
+        if (!string.IsNullOrWhiteSpace(sessionAccountName))
         {
+            accountName = sessionAccountName;
+        }
+        else
+        {
+            using var currentIdentity = WindowsIdentity.GetCurrent();
             accountName = currentIdentity.Name;
         }
 

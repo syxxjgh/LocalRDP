@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
+using DeskClone.Controls;
 using DeskClone.Core;
 using DeskClone.Views;
 using Microsoft.Extensions.DependencyInjection;
@@ -68,6 +69,15 @@ public sealed class ChildSessionService : IDisposable
     public int ConnectedState { get; private set; }
 
     public uint? ChildSessionId { get; private set; }
+
+    /// <summary>当前桌面分身会话中实际登录的账户（域\用户名）；没有会话或未登录时为 null。</summary>
+    public string? ChildSessionAccountName { get; private set; }
+
+    /// <summary>上次确认使用的桌面分身登录账户。</summary>
+    public string ConfiguredLoginUserName => _settings.RdpLoginUserName;
+
+    /// <summary>每次登录前是否需要确认登录账户。</summary>
+    public bool ConfirmLoginUserBeforeConnect => _settings.ConfirmLoginUserBeforeConnect;
 
     public bool SendSystemShortcutsToRemote { get; private set; } = true;
 
@@ -188,6 +198,48 @@ public sealed class ChildSessionService : IDisposable
         ThrowIfDisposed();
         ShowDesktopWindow(EnsureDesktopWindow());
         RefreshState();
+    }
+
+    public void SetConfirmLoginUserBeforeConnect(bool enabled)
+    {
+        ThrowIfDisposed();
+        _settings.ConfirmLoginUserBeforeConnect = enabled;
+        _settingsService.QueueSave();
+        RefreshState(enabled ? "每次登录前将确认登录账户" : "已关闭登录前的账户确认");
+    }
+
+    /// <summary>查询当前存活的桌面分身会话中登录的账户；没有会话时返回 null。</summary>
+    public string? TryGetExistingChildSessionAccount()
+    {
+        return ChildSessionNativeMethods.TryGetChildSessionId() is { } sessionId
+            ? ChildSessionNativeMethods.TryGetSessionAccountName(sessionId)
+            : null;
+    }
+
+    /// <summary>
+    /// 设置桌面分身的登录账户。账户必须与当前主桌面账户不同，否则会让分身与主桌面共用同一个账户。
+    /// password 只保存在内存中；为 null 时账户未变化则沿用已有密码，否则由 Windows 凭据窗口提示输入。
+    /// </summary>
+    public void ConfigureLoginCredentials(string accountInput, string? password)
+    {
+        ThrowIfDisposed();
+        var parsed = ChildSessionAccountHelper.ParseAccount(accountInput);
+        if (ChildSessionAccountHelper.IsCurrentWindowsUser(parsed.NormalizedAccount)
+            || ChildSessionAccountHelper.IsCurrentWindowsUser(accountInput))
+        {
+            throw new InvalidOperationException(
+                $"不能使用当前主桌面账户（{ChildSessionAccountHelper.GetCurrentWindowsAccountName()}）"
+                + "登录桌面分身，请改用其他独立账户。");
+        }
+
+        _settings.RdpLoginUserName = parsed.NormalizedAccount;
+        _settingsService.QueueSave();
+        EnsureDesktopWindow().RdpHost.SetLoginCredentials(
+            parsed.Domain,
+            parsed.UserName,
+            parsed.NormalizedAccount,
+            password);
+        RefreshState($"桌面分身登录账户已设为 {parsed.NormalizedAccount}");
     }
 
     public void HideWindow()
@@ -366,6 +418,7 @@ public sealed class ChildSessionService : IDisposable
             _connectionAttemptCompletionSource?.TrySetResult(false);
 
             TryDisconnectRdpHost();
+            _desktopWindow?.RdpHost.ClearLoginPassword();
             RefreshState("正在断开 RDP 并注销桌面分身");
 
             var terminatedSessionId = await Task.Run(() =>
@@ -399,6 +452,9 @@ public sealed class ChildSessionService : IDisposable
         {
             var enabled = ChildSessionNativeMethods.IsChildSessionsEnabled();
             ChildSessionId = ChildSessionNativeMethods.TryGetChildSessionId();
+            ChildSessionAccountName = ChildSessionId is { } accountSessionId
+                ? ChildSessionNativeMethods.TryGetSessionAccountName(accountSessionId)
+                : null;
             ConnectedState = _desktopWindow?.RdpHost.ConnectedState ?? 0;
 
             var connectionText = ConnectedState switch
@@ -411,8 +467,11 @@ public sealed class ChildSessionService : IDisposable
             var resolutionText = $"{_settings.DesktopWidth} × {_settings.DesktopHeight}";
             var mainText = _lastOperationMessage ?? connectionText;
 
+            var accountText = string.IsNullOrWhiteSpace(ChildSessionAccountName)
+                ? string.Empty
+                : $" | 账户：{ChildSessionAccountName}";
             StatusText =
-                $"{mainText} | RDP：{connectionText} | 分辨率：{resolutionText} | 功能已启用：{enabled}";
+                $"{mainText} | RDP：{connectionText} | 分辨率：{resolutionText}{accountText} | 功能已启用：{enabled}";
         }
         catch (Exception exception) when (IsExpectedChildSessionException(exception))
         {
@@ -454,6 +513,7 @@ public sealed class ChildSessionService : IDisposable
             _desktopWindow.IsVisibleChanged -= OnDesktopWindowVisibilityChanged;
             _desktopWindow.RdpHost.ConnectionFailed -= OnRdpConnectionFailed;
             _desktopWindow.RdpHost.LoginCompleted -= OnRdpLoginCompleted;
+            _desktopWindow.RdpHost.ClearLoginPassword();
             TryDisconnectRdpHost();
         }
 
@@ -606,6 +666,16 @@ public sealed class ChildSessionService : IDisposable
     {
         _lastConnectionFailure = e;
 
+        if (e.ErrorCode == RdpActiveXHost.ErrorSameUserBlocked)
+        {
+            // 与主桌面同账户的登录绝不自动重试，并清理可能已经创建出来的冲突会话。
+            _pendingRdpSettingChanges = RdpSettingChange.None;
+            _rdpSettingsReconnectRetriesRemaining = 0;
+            _initialConnectionRetriesRemaining = 0;
+            _ = TerminateConflictingChildSessionAsync();
+            CompleteConnectionFailure(e);
+            return;
+        }
         if (_pendingRdpSettingChanges != RdpSettingChange.None)
         {
             if (_rdpSettingsReconnectRetryInProgress)
@@ -635,6 +705,36 @@ public sealed class ChildSessionService : IDisposable
     // 使用 OnLoginComplete 等待实际登录完成，避免依赖固定时长的延时。
     private async void OnRdpLoginCompleted(object? sender, EventArgs e)
     {
+        // 最后一道保险：无论 RDP 控件怎么选的账户，只要实际登录的是主桌面账户就立即撤销。
+        var loggedInSessionId = ChildSessionNativeMethods.TryGetChildSessionId();
+        var actualAccount = loggedInSessionId is { } loggedSessionId
+            ? ChildSessionNativeMethods.TryGetSessionAccountName(loggedSessionId)
+            : null;
+        if (!string.IsNullOrWhiteSpace(actualAccount)
+            && ChildSessionAccountHelper.IsCurrentWindowsUser(actualAccount))
+        {
+            _logger.LogError(
+                "桌面分身实际登录到了与当前主桌面相同的账户：{Account}，会话 ID={SessionId}，将断开并注销该会话。",
+                actualAccount,
+                loggedInSessionId);
+            _initialConnectionRetriesRemaining = 0;
+            _connectionRetryInProgress = false;
+            _pendingRdpSettingChanges = RdpSettingChange.None;
+            _rdpSettingsReconnectRetriesRemaining = 0;
+            TryDisconnectRdpHost();
+            await TerminateConflictingChildSessionAsync();
+            CompleteConnectionFailure(new ChildSessionConnectionFailedEventArgs(
+                $"检测到桌面分身实际登录到了与当前主桌面相同的账户（{actualAccount}）。"
+                + "为避免主桌面登录状态异常，已自动断开并注销该冲突会话，请确认使用其他独立账户重新登录。",
+                RdpActiveXHost.ErrorSameUserBlocked));
+            return;
+        }
+
+        _logger.LogInformation(
+            "桌面分身登录完成，会话 ID={SessionId}，登录账户={Account}",
+            loggedInSessionId,
+            actualAccount ?? "(未知)");
+
         _lastConnectionFailure = null;
         _initialConnectionRetriesRemaining = 0;
         _connectionRetryInProgress = false;
@@ -672,6 +772,33 @@ public sealed class ChildSessionService : IDisposable
         }
 
         await Task.Yield();
+    }
+
+    /// <summary>
+    /// 如果当前桌面分身会话登录的是与主桌面相同的账户，注销该会话。
+    /// </summary>
+    private async Task TerminateConflictingChildSessionAsync()
+    {
+        try
+        {
+            if (ChildSessionNativeMethods.TryGetChildSessionId() is not { } sessionId)
+            {
+                return;
+            }
+
+            var account = ChildSessionNativeMethods.TryGetSessionAccountName(sessionId);
+            if (string.IsNullOrWhiteSpace(account)
+                || !ChildSessionAccountHelper.IsCurrentWindowsUser(account))
+            {
+                return;
+            }
+
+            await Task.Run(() => ChildSessionNativeMethods.TerminateChildSession(sessionId));
+        }
+        catch (Exception exception) when (IsExpectedChildSessionException(exception))
+        {
+            _logger.LogWarning("注销冲突的桌面分身会话失败：{ErrorMessage}", exception.GetBaseException().Message);
+        }
     }
 
     private async void RetryRdpSettingsReconnectAsync(

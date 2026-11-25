@@ -34,6 +34,19 @@ internal sealed class RdpActiveXHost : AxHost
     private bool _smartSizingEnabled = true;
     private bool _inputBlocked;
 
+    /// <summary>
+    /// 桌面分身试图使用与当前主桌面相同的 Windows 账户登录时上报的错误码。
+    /// 该错误不会自动重试。
+    /// </summary>
+    internal const int ErrorSameUserBlocked = -1001;
+
+    private string _targetDomain = string.Empty;
+    private string _targetUserName = string.Empty;
+    private string _targetDisplayAccount = string.Empty;
+
+    // 仅保存在内存中，不写入日志、设置文件或注册表。
+    private string? _sessionPassword;
+
     internal event EventHandler<ChildSessionConnectionFailedEventArgs>? ConnectionFailed;
 
     internal event EventHandler? LoginCompleted;
@@ -69,6 +82,16 @@ internal sealed class RdpActiveXHost : AxHost
             return;
         }
 
+        // 没有明确的登录账户时，RDP 会沿用当前用户的默认凭据，登录到与主桌面相同的账户，
+        // 因此必须拒绝在没有指定独立账户的情况下发起连接。
+        if (string.IsNullOrWhiteSpace(_targetUserName)
+            || ChildSessionAccountHelper.IsCurrentWindowsUser(_targetDisplayAccount)
+            || ChildSessionAccountHelper.IsCurrentWindowsUser(_targetUserName))
+        {
+            throw new InvalidOperationException(
+                "必须指定与当前主桌面不同的 Windows 账户才能连接桌面分身。");
+        }
+
         ChildSessionNativeMethods.ClearRdpInputWindowCache(Handle);
         var client = GetRequiredOcx();
         var width = Math.Clamp(desktopSize.Width, 200, 8192);
@@ -78,8 +101,15 @@ internal sealed class RdpActiveXHost : AxHost
         SetComProperty(client, "DesktopWidth", width);
         SetComProperty(client, "DesktopHeight", height);
         SetComProperty(client, "ColorDepth", 32);
-        SetComProperty(client, "ConnectingText", "正在创建 BetterGI 桌面分身...");
-        SetComProperty(client, "DisconnectedText", "BetterGI 桌面分身已断开");
+        SetComProperty(client, "ConnectingText", $"正在以 {_targetDisplayAccount} 创建桌面分身...");
+        SetComProperty(client, "DisconnectedText", "桌面分身已断开");
+
+        // 明确指定登录账户，并清除控件内残留的旧密码，避免回落到当前用户的默认凭据。
+        var nonScriptableClient = (IMsRdpClientNonScriptable)client;
+        RunComStep("清除旧密码", nonScriptableClient.ResetPassword);
+        RunComStep("设置登录域", () => SetComProperty(client, "Domain", _targetDomain));
+        RunComStep("设置登录用户名", () => SetComProperty(client, "UserName", _targetUserName));
+        ApplyCredentialSettings(client, nonScriptableClient);
 
         var securedSettings = GetComProperty(client, "SecuredSettings2")
             ?? throw new COMException("RDP ActiveX 未返回 SecuredSettings2。");
@@ -128,6 +158,80 @@ internal sealed class RdpActiveXHost : AxHost
         {
             _connectionAttemptInProgress = false;
             throw;
+        }
+    }
+
+    /// <summary>
+    /// 设置下次连接使用的登录账户。password 为 null 时：账户未变化则保留已有密码，
+    /// 账户变化则清空密码（交由 Windows 凭据窗口提示输入）。
+    /// </summary>
+    internal void SetLoginCredentials(
+        string domain,
+        string userName,
+        string displayAccount,
+        string? password)
+    {
+        var accountChanged = !string.Equals(
+            _targetDisplayAccount,
+            displayAccount,
+            StringComparison.OrdinalIgnoreCase);
+
+        _targetDomain = domain;
+        _targetUserName = userName;
+        _targetDisplayAccount = displayAccount;
+
+        if (!string.IsNullOrEmpty(password))
+        {
+            _sessionPassword = password;
+        }
+        else if (accountChanged)
+        {
+            _sessionPassword = null;
+        }
+    }
+
+    internal bool HasLoginAccount(string displayAccount)
+    {
+        return !string.IsNullOrWhiteSpace(_targetUserName)
+               && string.Equals(
+                   _targetDisplayAccount,
+                   displayAccount,
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal void ClearLoginPassword()
+    {
+        _sessionPassword = null;
+    }
+
+    private void ApplyCredentialSettings(
+        object client,
+        IMsRdpClientNonScriptable nonScriptableClient)
+    {
+        var hasPassword = !string.IsNullOrEmpty(_sessionPassword);
+        if (hasPassword)
+        {
+            RunComStep("设置登录密码", () => nonScriptableClient.put_ClearTextPassword(_sessionPassword!));
+        }
+
+        // 没有密码时由 RDP 控件弹出 Windows 凭据窗口，并预填上面设置的账户；
+        // 有密码时直接登录，不再弹窗。较旧的系统不支持这些接口，忽略即可。
+        try
+        {
+            ((IMsRdpClientNonScriptable3)client).put_PromptForCredentials(!hasPassword);
+        }
+        catch (Exception exception) when (exception is InvalidCastException or COMException)
+        {
+        }
+
+        try
+        {
+            var nonScriptable4 = (IMsRdpClientNonScriptable4)client;
+            nonScriptable4.put_PromptForCredsOnClient(!hasPassword);
+            nonScriptable4.put_AllowCredentialSaving(false);
+        }
+        catch (Exception exception) when (exception is InvalidCastException or COMException)
+        {
         }
     }
 
@@ -435,6 +539,35 @@ internal sealed class RdpActiveXHost : AxHost
             ReportConnectionFailure(
                 $"RDP 自动重新连接失败：{actualException.Message}",
                 errorCode);
+        }
+    }
+
+    /// <summary>
+    /// RDP 登录后回报实际登录的用户名。如果与当前主桌面账户相同，立即报错并断开，
+    /// 避免分身与主桌面共用同一个账户导致登录状态冲突。
+    /// </summary>
+    private void OnUserNameAcquired(string userName)
+    {
+        if (_disconnectRequested
+            || !ChildSessionAccountHelper.IsCurrentWindowsUser(userName))
+        {
+            return;
+        }
+
+        _pendingReconnectDesktopSize = null;
+        _connectionAttemptInProgress = false;
+        ReportConnectionFailure(
+            $"已拦截登录：RDP 尝试使用与当前主桌面相同的 Windows 账户（{userName}）登录桌面分身。\n\n"
+            + "为避免主桌面登录状态冲突，已自动中止连接，请选择其他独立 Windows 账户（例如本机辅助账户）后重试。",
+            ErrorSameUserBlocked);
+
+        try
+        {
+            _ = DisconnectCore();
+        }
+        catch (Exception exception) when (exception is COMException or TargetInvocationException)
+        {
+            // ActiveX 正在自行断开时可能返回 COM 错误，连接失败已经上报。
         }
     }
 
@@ -920,6 +1053,7 @@ internal sealed class RdpActiveXHost : AxHost
 
         public void OnUserNameAcquired(string userName)
         {
+            owner.OnUserNameAcquired(userName);
         }
 
         public void OnMouseInputModeChanged(bool isRelativeMouseMode)
@@ -1050,6 +1184,220 @@ internal sealed class RdpActiveXHost : AxHost
             int numKeys,
             [In] ref short keyUpStates,
             [In] ref int keyData);
+    }
+
+    // 以下两个接口按 vtable 顺序重新声明了全部继承的方法，
+    // 因为 .NET COM 互操作不会自动合并基接口的 vtable。
+    [ComImport]
+    [Guid("B3378D90-0728-45C7-8ED7-B6159FB92219")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMsRdpClientNonScriptable3
+    {
+        void put_ClearTextPassword([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        void put_PortablePassword([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_PortablePassword();
+
+        void put_PortableSalt([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_PortableSalt();
+
+        void put_BinaryPassword([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_BinaryPassword();
+
+        void put_BinarySalt([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_BinarySalt();
+
+        void ResetPassword();
+
+        void NotifyRedirectDeviceChange(nuint wParam, nint lParam);
+
+        void SendKeys(int numKeys, [In] ref short keyUpStates, [In] ref int keyData);
+
+        void put_UIParentWindowHandle(nint value);
+
+        nint get_UIParentWindowHandle();
+
+        void put_ShowRedirectionWarningDialog([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_ShowRedirectionWarningDialog();
+
+        void put_PromptForCredentials([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_PromptForCredentials();
+
+        void put_NegotiateSecurityLayer([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_NegotiateSecurityLayer();
+
+        void put_EnableCredSspSupport([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_EnableCredSspSupport();
+
+        void put_RedirectDynamicDrives([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_RedirectDynamicDrives();
+
+        void put_RedirectDynamicDevices([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_RedirectDynamicDevices();
+
+        nint get_DeviceCollection();
+
+        nint get_DriveCollection();
+
+        void put_WarnAboutSendingCredentials([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_WarnAboutSendingCredentials();
+
+        void put_WarnAboutClipboardRedirection([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_WarnAboutClipboardRedirection();
+
+        void put_ConnectionBarText([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_ConnectionBarText();
+    }
+
+    [ComImport]
+    [Guid("F50FA8AA-1C7D-4F59-B15C-A90CACAE1FCB")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMsRdpClientNonScriptable4
+    {
+        void put_ClearTextPassword([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        void put_PortablePassword([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_PortablePassword();
+
+        void put_PortableSalt([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_PortableSalt();
+
+        void put_BinaryPassword([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_BinaryPassword();
+
+        void put_BinarySalt([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_BinarySalt();
+
+        void ResetPassword();
+
+        void NotifyRedirectDeviceChange(nuint wParam, nint lParam);
+
+        void SendKeys(int numKeys, [In] ref short keyUpStates, [In] ref int keyData);
+
+        void put_UIParentWindowHandle(nint value);
+
+        nint get_UIParentWindowHandle();
+
+        void put_ShowRedirectionWarningDialog([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_ShowRedirectionWarningDialog();
+
+        void put_PromptForCredentials([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_PromptForCredentials();
+
+        void put_NegotiateSecurityLayer([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_NegotiateSecurityLayer();
+
+        void put_EnableCredSspSupport([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_EnableCredSspSupport();
+
+        void put_RedirectDynamicDrives([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_RedirectDynamicDrives();
+
+        void put_RedirectDynamicDevices([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_RedirectDynamicDevices();
+
+        nint get_DeviceCollection();
+
+        nint get_DriveCollection();
+
+        void put_WarnAboutSendingCredentials([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_WarnAboutSendingCredentials();
+
+        void put_WarnAboutClipboardRedirection([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_WarnAboutClipboardRedirection();
+
+        void put_ConnectionBarText([In, MarshalAs(UnmanagedType.BStr)] string value);
+
+        [return: MarshalAs(UnmanagedType.BStr)]
+        string get_ConnectionBarText();
+
+        void put_RedirectionWarningType(int value);
+
+        int get_RedirectionWarningType();
+
+        void put_MarkRdpSettingsSecure([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_MarkRdpSettingsSecure();
+
+        void put_PublisherCertificateChain(nint value);
+
+        nint get_PublisherCertificateChain();
+
+        void put_WarnAboutPrinterRedirection([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_WarnAboutPrinterRedirection();
+
+        void put_AllowCredentialSaving([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_AllowCredentialSaving();
+
+        void put_PromptForCredsOnClient([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_PromptForCredsOnClient();
+
+        void put_LaunchedViaClientShellInterface([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_LaunchedViaClientShellInterface();
+
+        void put_TrustedZoneSite([In, MarshalAs(UnmanagedType.VariantBool)] bool value);
+
+        [return: MarshalAs(UnmanagedType.VariantBool)]
+        bool get_TrustedZoneSite();
     }
 
     private readonly record struct RemoteKey(int ScanCode, bool IsExtended);

@@ -43,6 +43,18 @@ internal static class ChildSessionNativeMethods
         uint sessionId,
         [MarshalAs(UnmanagedType.Bool)] bool wait);
 
+    [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WTSQuerySessionInformationW(
+        IntPtr serverHandle,
+        uint sessionId,
+        WtsInfoClass infoClass,
+        out IntPtr buffer,
+        out uint bytesReturned);
+
+    [DllImport("wtsapi32.dll")]
+    private static extern void WTSFreeMemory(IntPtr memory);
+
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool EnumChildWindows(
@@ -143,6 +155,56 @@ internal static class ChildSessionNativeMethods
         return WTSGetChildSessionId(out var sessionId) && sessionId != NoChildSessionId
             ? sessionId
             : null;
+    }
+
+    /// <summary>
+    /// 查询指定会话中登录的账户（域\用户名）。会话尚未登录或查询失败时返回 null。
+    /// </summary>
+    internal static string? TryGetSessionAccountName(uint sessionId)
+    {
+        var userName = QuerySessionString(sessionId, WtsInfoClass.WtsUserName);
+        if (string.IsNullOrWhiteSpace(userName))
+        {
+            return null;
+        }
+
+        var domainName = QuerySessionString(sessionId, WtsInfoClass.WtsDomainName);
+        return string.IsNullOrWhiteSpace(domainName)
+            ? userName
+            : $"{domainName}\\{userName}";
+    }
+
+    private static string? QuerySessionString(uint sessionId, WtsInfoClass infoClass)
+    {
+        var buffer = IntPtr.Zero;
+        try
+        {
+            if (!WTSQuerySessionInformationW(
+                    CurrentServerHandle,
+                    sessionId,
+                    infoClass,
+                    out buffer,
+                    out _)
+                || buffer == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            return Marshal.PtrToStringUni(buffer);
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero)
+            {
+                WTSFreeMemory(buffer);
+            }
+        }
+    }
+
+    private enum WtsInfoClass
+    {
+        WtsUserName = 5,
+        WtsDomainName = 7
     }
 
     internal static uint? TerminateChildSession()
