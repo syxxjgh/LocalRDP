@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="1.0.0.0" name="DeskClone.app"/>
+  <assemblyIdentity version="1.0.1.0" name="DeskClone.app"/>
 
   <!-- 启用/注销 Child Session、注册计划任务都需要管理员权限 -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
